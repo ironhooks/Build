@@ -1,4 +1,3 @@
-
 name: Google Drive APK Builder
 
 on:
@@ -10,13 +9,12 @@ on:
         type: string
 
       release_tag:
-        description: "GitHub Release Tag"
+        description: "Build Label"
         required: true
         default: "latest-build"
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   build:
@@ -25,18 +23,45 @@ jobs:
 
     steps:
 
-      # 1. Checkout Repository
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      # 1. Setup SSH Authentication
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
 
-      # 2. Setup Java
+          if [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "ERROR: SSH_PRIVATE_KEY secret missing!"
+            exit 1
+          fi
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+          ssh -T git@github.com || true
+
+      # 2. Clone Repository Using SSH
+      - name: Clone Repository
+        run: |
+          git clone \
+            --branch "$GITHUB_REF_NAME" \
+            "git@github.com:${GITHUB_REPOSITORY}.git" \
+            repo
+
+          echo "Repository cloned successfully!"
+
+      # 3. Setup Java
       - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 3. Setup Android SDK
+      # 4. Setup Android SDK
       - name: Setup Android SDK
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
@@ -46,7 +71,7 @@ jobs:
 
           echo "Android SDK: $ANDROID_HOME"
 
-      # 4. Install SDK Packages
+      # 5. Install Android SDK Packages
       - name: Install Android SDK Packages
         run: |
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
@@ -66,13 +91,13 @@ jobs:
 
           yes | "$SDKMANAGER" --licenses
 
-      # 5. Install Download Tools
+      # 6. Install Download Tools
       - name: Install Download Tools
         run: |
           python -m pip install --upgrade pip
           pip install gdown
 
-      # 6. Download Google Drive ZIP
+      # 7. Download Google Drive ZIP
       - name: Download Source ZIP
         env:
           DRIVE_URL: ${{ inputs.google_drive_url }}
@@ -96,7 +121,7 @@ jobs:
 
           echo "Download successful!"
 
-      # 7. Extract ZIP
+      # 8. Extract Source ZIP
       - name: Extract Source Code
         run: |
           mkdir -p source
@@ -105,17 +130,15 @@ jobs:
 
           echo "ZIP extracted!"
 
-          echo "ZIP contents:"
           find source -maxdepth 3 -type f | head -100
 
-      # 8. Smart Android Project Detection
+      # 9. Locate Android Project
       - name: Locate Android Project
         run: |
           echo "Searching Android project..."
 
           PROJECT_DIR=""
 
-          # Find Gradle Wrapper
           GRADLE_FILE=$(find source \
             -type f \
             -name gradlew \
@@ -123,18 +146,10 @@ jobs:
             | head -n 1)
 
           if [ -n "$GRADLE_FILE" ]; then
-
             PROJECT_DIR=$(dirname "$GRADLE_FILE")
-
             chmod +x "$GRADLE_FILE"
 
-            echo "Gradle Wrapper found!"
-
           else
-
-            echo "Gradle Wrapper not found."
-
-            # Find settings.gradle
             SETTINGS_FILE=$(find source \
               -type f \
               \( -name settings.gradle -o -name settings.gradle.kts \) \
@@ -142,12 +157,9 @@ jobs:
               | head -n 1)
 
             if [ -n "$SETTINGS_FILE" ]; then
-
               PROJECT_DIR=$(dirname "$SETTINGS_FILE")
 
             else
-
-              # Find build.gradle
               BUILD_FILE=$(find source \
                 -type f \
                 \( -name build.gradle -o -name build.gradle.kts \) \
@@ -157,13 +169,11 @@ jobs:
               if [ -n "$BUILD_FILE" ]; then
                 PROJECT_DIR=$(dirname "$BUILD_FILE")
               fi
-
             fi
-
           fi
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Android Gradle project not found!"
+            echo "ERROR: Android project not found!"
             exit 1
           fi
 
@@ -171,32 +181,28 @@ jobs:
 
           echo "Project found: $PROJECT_DIR"
 
-      # 9. Setup Gradle
+      # 10. Setup Gradle
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # 10. Build Debug APK
+      # 11. Build Debug APK
       - name: Build Debug APK
         run: |
           cd "$PROJECT_DIR"
 
           if [ -f "./gradlew" ]; then
-
             chmod +x ./gradlew
 
             ./gradlew assembleDebug \
               --no-daemon \
               --stacktrace
-
           else
-
             gradle assembleDebug \
               --no-daemon \
               --stacktrace
-
           fi
 
-      # 11. Collect APK
+      # 12. Collect APK Files
       - name: Collect APK Files
         run: |
           mkdir -p output
@@ -215,7 +221,7 @@ jobs:
           echo "Generated APK files:"
           find output -name "*.apk"
 
-      # 12. Upload APK Artifact
+      # 13. Upload APK Artifact
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -224,37 +230,51 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 13. Prepare Release
+      # 14. Prepare Release Folder
       - name: Prepare Release
         run: |
-          mkdir -p release
+          mkdir -p repo/release
 
           find output \
             -type f \
             -name "*.apk" \
             | while read -r apk; do
-
-              cp "$apk" "release/$(basename "$apk")"
-
+              cp "$apk" "repo/release/$(basename "$apk")"
             done
 
-          echo "Release files:"
-          ls -lh release/
+          echo "APK files prepared:"
+          ls -lh repo/release/
 
-      # 14. Create GitHub Release
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          name: APK Build ${{ inputs.release_tag }}
-          body: |
-            Automated Android APK Build
+      # 15. Commit and Push APK Using SSH
+      - name: Commit and Push APK
+        run: |
+          cd repo
 
-            Source: Google Drive ZIP
-            Build Type: Debug APK
-            Build System: GitHub Actions
+          git config user.name "APK Builder"
+          git config user.email "apk-builder@users.noreply.github.com"
 
-            Download the APK from Assets below.
-          files: release/*.apk
-          fail_on_unmatched_files: true
-          make_latest: true
+          git add -A release/
+
+          if git diff --cached --quiet; then
+            echo "No APK changes detected."
+          else
+            git commit -m "chore: update APK build [skip ci]"
+
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+
+            echo "APK committed and pushed successfully!"
+          fi
+
+      # 16. Build Summary
+      - name: Build Summary
+        if: success()
+        run: |
+          echo "================================"
+          echo "APK BUILD SUCCESSFUL"
+          echo "================================"
+          echo "Build Label: ${{ inputs.release_tag }}"
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "APK Location: release/"
+          echo "Commit & Push: Completed"
+          echo "================================"
